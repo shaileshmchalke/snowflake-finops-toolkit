@@ -1,11 +1,10 @@
 """
-Cost Analyzer — MTD/YTD cost, idle waste, cloud services, user attribution.
-Supports both ACCOUNT_USAGE (production) and FINOPS_SAMPLE (demo) tables.
-Author: Shailesh Chalke — Senior Snowflake Consultant
+Cost Analyzer - MTD, YTD, daily trends, idle waste, cloud services.
+Author: Shailesh Chalke
 """
 
 import logging
-from datetime import datetime, timedelta
+from typing import Optional
 
 import pandas as pd
 
@@ -16,31 +15,16 @@ logger = logging.getLogger(__name__)
 
 class CostAnalyzer:
     """
-    Analyzes Snowflake compute costs across multiple dimensions:
-    - MTD / YTD aggregate costs
-    - Daily cost trend (28-day rolling)
-    - Idle/wasted compute detection
-    - Cloud services cost monitoring
-    - Per-user credit attribution
+    Analyzes Snowflake credit consumption.
+    Auto-detects mode: ACCOUNT_USAGE (production) or sample tables (demo).
     """
 
-    # Snowflake: 1 credit = 3600 seconds of a single-node XSMALL
-    # Size multipliers relative to X-SMALL
-    SIZE_CREDIT_MULTIPLIERS = {
-        "X-SMALL": 1, "SMALL": 2, "MEDIUM": 4, "LARGE": 8,
-        "X-LARGE": 16, "2X-LARGE": 32, "3X-LARGE": 64, "4X-LARGE": 128,
-    }
-
     def __init__(self, connector: SnowflakeConnector):
-        self.conn   = connector
-        self._mode  = self._detect_mode()
+        self.conn  = connector
+        self._mode = self._detect_mode()
         logger.info(f"CostAnalyzer: running in {self._mode} mode")
 
     def _detect_mode(self) -> str:
-        """
-        Auto-detect whether ACCOUNT_USAGE or FINOPS_SAMPLE tables are available.
-        Returns 'account_usage' or 'sample'.
-        """
         try:
             self.conn.query_to_df(
                 "SELECT 1 FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY LIMIT 1"
@@ -49,65 +33,54 @@ class CostAnalyzer:
         except Exception:
             return "sample"
 
-    # ─────────────────────────────────────────
-    # MTD COST
-    # ─────────────────────────────────────────
     def get_mtd_cost(self) -> float:
-        """Return total credits consumed month-to-date."""
+        """Return month-to-date total credits consumed."""
         if self._mode == "account_usage":
             sql = """
                 SELECT COALESCE(SUM(credits_used), 0) AS total_credits
                 FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
-                WHERE DATE_TRUNC('MONTH', start_time) = DATE_TRUNC('MONTH', CURRENT_DATE())
-                  AND start_time < CURRENT_TIMESTAMP()
+                WHERE start_time >= DATE_TRUNC('MONTH', CURRENT_DATE())
             """
         else:
             sql = """
                 SELECT COALESCE(SUM(total_credits), 0) AS total_credits
                 FROM FINOPS_DEMO.FINOPS_SAMPLE.WH_METERING_HISTORY
-                WHERE DATE_TRUNC('MONTH', usage_date) = DATE_TRUNC('MONTH', CURRENT_DATE())
+                WHERE usage_date >= DATE_TRUNC('MONTH', CURRENT_DATE())
             """
         df = self.conn.query_to_df(sql)
-        return float(df["total_credits"].iloc[0]) if not df.empty else 0.0
+        if df.empty:
+            return 0.0
+        return float(df["total_credits"].iloc[0])
 
-    # ─────────────────────────────────────────
-    # YTD COST
-    # ─────────────────────────────────────────
     def get_ytd_cost(self) -> float:
-        """Return total credits consumed year-to-date."""
+        """Return year-to-date total credits consumed."""
         if self._mode == "account_usage":
             sql = """
                 SELECT COALESCE(SUM(credits_used), 0) AS total_credits
                 FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
-                WHERE DATE_TRUNC('YEAR', start_time) = DATE_TRUNC('YEAR', CURRENT_DATE())
-                  AND start_time < CURRENT_TIMESTAMP()
+                WHERE start_time >= DATE_TRUNC('YEAR', CURRENT_DATE())
             """
         else:
             sql = """
                 SELECT COALESCE(SUM(total_credits), 0) AS total_credits
                 FROM FINOPS_DEMO.FINOPS_SAMPLE.WH_METERING_HISTORY
-                WHERE DATE_TRUNC('YEAR', usage_date) = DATE_TRUNC('YEAR', CURRENT_DATE())
+                WHERE usage_date >= DATE_TRUNC('YEAR', CURRENT_DATE())
             """
         df = self.conn.query_to_df(sql)
-        return float(df["total_credits"].iloc[0]) if not df.empty else 0.0
+        if df.empty:
+            return 0.0
+        return float(df["total_credits"].iloc[0])
 
-    # ─────────────────────────────────────────
-    # DAILY TREND
-    # ─────────────────────────────────────────
     def get_daily_cost_trend(self, days: int = 28) -> pd.DataFrame:
-        """
-        Return daily credit consumption for the last N days.
-        Columns: usage_date, warehouse_name, total_credits
-        """
+        """Return daily credit usage for last N days, by warehouse."""
         if self._mode == "account_usage":
             sql = f"""
                 SELECT
                     DATE_TRUNC('DAY', start_time)::DATE AS usage_date,
                     warehouse_name,
-                    SUM(credits_used)                    AS total_credits
+                    SUM(credits_used)                   AS total_credits
                 FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
                 WHERE start_time >= DATEADD('DAY', -{days}, CURRENT_DATE())
-                  AND start_time <  CURRENT_TIMESTAMP()
                 GROUP BY 1, 2
                 ORDER BY 1, 2
             """
@@ -122,79 +95,46 @@ class CostAnalyzer:
                 GROUP BY 1, 2
                 ORDER BY 1, 2
             """
-        df = self.conn.query_to_df(sql)
-        if not df.empty:
-            df["usage_date"] = pd.to_datetime(df["usage_date"])
-        return df
+        try:
+            return self.conn.query_to_df(sql)
+        except Exception as e:
+            logger.error(f"get_daily_cost_trend failed: {e}")
+            return pd.DataFrame()
 
-    # ─────────────────────────────────────────
-    # IDLE WASTE
-    # ─────────────────────────────────────────
-    def get_idle_waste(self) -> float:
-        """
-        Estimate credits wasted on idle warehouses this month.
-        Idle = credits billed with zero query activity.
-        """
-        if self._mode == "account_usage":
-            sql = """
-                SELECT COALESCE(SUM(credits_used_cloud_services), 0) AS idle_credits
-                FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
-                WHERE DATE_TRUNC('MONTH', start_time) = DATE_TRUNC('MONTH', CURRENT_DATE())
-                  AND credits_used_compute > 0
-                  AND credits_used_cloud_services / NULLIF(credits_used_compute, 0) > 0.1
-            """
-        else:
-            sql = """
-                SELECT COALESCE(SUM(idle_credits), 0) AS idle_credits
-                FROM FINOPS_DEMO.FINOPS_SAMPLE.WH_METERING_HISTORY
-                WHERE DATE_TRUNC('MONTH', usage_date) = DATE_TRUNC('MONTH', CURRENT_DATE())
-            """
-        df = self.conn.query_to_df(sql)
-        return float(df["idle_credits"].iloc[0]) if not df.empty else 0.0
-
-    # ─────────────────────────────────────────
-    # CLOUD SERVICES COST
-    # ─────────────────────────────────────────
     def get_cloud_services_cost(self) -> float:
-        """
-        Return cloud services credits consumed MTD.
-        Snowflake guideline: cloud services > 10% of compute = investigate.
-        """
+        """Return MTD cloud services credits (metadata, compilation overhead)."""
         if self._mode == "account_usage":
             sql = """
-                SELECT COALESCE(SUM(credits_used_cloud_services), 0) AS cloud_credits
+                SELECT COALESCE(SUM(credits_used_cloud_services), 0) AS total_credits
                 FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
-                WHERE DATE_TRUNC('MONTH', start_time) = DATE_TRUNC('MONTH', CURRENT_DATE())
-                  AND start_time < CURRENT_TIMESTAMP()
+                WHERE start_time >= DATE_TRUNC('MONTH', CURRENT_DATE())
             """
         else:
             sql = """
-                SELECT COALESCE(SUM(cloud_services_credits), 0) AS cloud_credits
+                SELECT COALESCE(SUM(cloud_services_credits), 0) AS total_credits
                 FROM FINOPS_DEMO.FINOPS_SAMPLE.WH_METERING_HISTORY
-                WHERE DATE_TRUNC('MONTH', usage_date) = DATE_TRUNC('MONTH', CURRENT_DATE())
+                WHERE usage_date >= DATE_TRUNC('MONTH', CURRENT_DATE())
             """
-        df = self.conn.query_to_df(sql)
-        return float(df["cloud_credits"].iloc[0]) if not df.empty else 0.0
+        try:
+            df = self.conn.query_to_df(sql)
+            if df.empty:
+                return 0.0
+            return float(df["total_credits"].iloc[0])
+        except Exception as e:
+            logger.error(f"get_cloud_services_cost failed: {e}")
+            return 0.0
 
-    # ─────────────────────────────────────────
-    # USER ATTRIBUTION
-    # ─────────────────────────────────────────
     def get_user_attribution(self) -> pd.DataFrame:
-        """
-        Return per-user credit consumption for this month.
-        Columns: user_name, total_credits, query_count
-        """
+        """Return MTD credit attribution by user."""
         if self._mode == "account_usage":
             sql = """
                 SELECT
-                    qh.user_name,
-                    SUM(wmh.credits_used)       AS total_credits,
-                    COUNT(DISTINCT qh.query_id) AS query_count
-                FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY qh
-                JOIN SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY wmh
-                    ON qh.warehouse_name = wmh.warehouse_name
-                    AND DATE_TRUNC('HOUR', qh.start_time) = DATE_TRUNC('HOUR', wmh.start_time)
-                WHERE DATE_TRUNC('MONTH', qh.start_time) = DATE_TRUNC('MONTH', CURRENT_DATE())
+                    user_name,
+                    SUM(credits_used_cloud_services) AS total_credits,
+                    COUNT(DISTINCT query_id)          AS query_count
+                FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+                WHERE start_time >= DATE_TRUNC('MONTH', CURRENT_DATE())
+                  AND user_name IS NOT NULL
                 GROUP BY 1
                 ORDER BY 2 DESC
                 LIMIT 20
@@ -206,17 +146,62 @@ class CostAnalyzer:
                     SUM(total_credits) AS total_credits,
                     SUM(query_count)   AS query_count
                 FROM FINOPS_DEMO.FINOPS_SAMPLE.USER_ATTRIBUTION
-                WHERE DATE_TRUNC('MONTH', usage_date) = DATE_TRUNC('MONTH', CURRENT_DATE())
+                WHERE usage_date >= DATE_TRUNC('MONTH', CURRENT_DATE())
                 GROUP BY 1
                 ORDER BY 2 DESC
                 LIMIT 20
             """
-        return self.conn.query_to_df(sql)
+        try:
+            return self.conn.query_to_df(sql)
+        except Exception as e:
+            logger.error(f"get_user_attribution failed: {e}")
+            return pd.DataFrame()
 
-    # ─────────────────────────────────────────
-    # HELPER: Credit → USD
-    # ─────────────────────────────────────────
+    def get_idle_waste(self) -> float:
+        """
+        Return estimated MTD idle credits (hours billed with zero queries).
+        Only available in account_usage mode.
+        """
+        if self._mode == "account_usage":
+            sql = """
+                WITH hourly AS (
+                    SELECT
+                        warehouse_name,
+                        DATE_TRUNC('HOUR', start_time) AS billing_hour,
+                        SUM(credits_used)              AS hour_credits
+                    FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+                    WHERE start_time >= DATE_TRUNC('MONTH', CURRENT_DATE())
+                    GROUP BY 1, 2
+                ),
+                with_queries AS (
+                    SELECT
+                        h.warehouse_name,
+                        h.billing_hour,
+                        h.hour_credits,
+                        COUNT(q.query_id) AS queries_in_hour
+                    FROM hourly h
+                    LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q
+                        ON h.warehouse_name = q.warehouse_name
+                       AND DATE_TRUNC('HOUR', q.start_time) = h.billing_hour
+                    GROUP BY 1, 2, 3
+                )
+                SELECT COALESCE(SUM(CASE WHEN queries_in_hour = 0 THEN hour_credits ELSE 0 END), 0)
+                    AS idle_credits
+                FROM with_queries
+            """
+            try:
+                df = self.conn.query_to_df(sql)
+                if df.empty:
+                    return 0.0
+                return float(df["idle_credits"].iloc[0])
+            except Exception as e:
+                logger.error(f"get_idle_waste failed: {e}")
+                return 0.0
+        else:
+            # Sample mode: estimate 35% of MTD as idle
+            return self.get_mtd_cost() * 0.35
+
     @staticmethod
     def credits_to_usd(credits: float, price_per_credit: float = 3.00) -> float:
-        """Convert credit count to USD. Default $3.00/credit (on-demand)."""
+        """Convert credit count to USD."""
         return round(credits * price_per_credit, 2)

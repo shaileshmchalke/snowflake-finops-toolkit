@@ -1,27 +1,19 @@
-# 🛠️ Setup Guide — Snowflake FinOps Toolkit
-
-**Author:** Shailesh Chalke — Senior Snowflake Consultant  
-**Audience:** Engineers setting up this toolkit for the first time.
-
----
+# SETUP Guide — Snowflake FinOps Toolkit
 
 ## Prerequisites
 
-| Requirement          | Version / Details                          |
-|----------------------|--------------------------------------------|
-| Python               | 3.10 or higher                             |
-| pip                  | Latest (comes with Python)                 |
-| Git                  | Any recent version                         |
-| Git Bash (Windows)   | Recommended for Windows users              |
-| Snowflake Account    | Trial account works: snowflake.com/trial   |
-| Snowflake Role       | SYSADMIN (or role with CREATE DATABASE)    |
+| Tool | Version | Download |
+|------|---------|----------|
+| Python | 3.10 or higher | https://python.org |
+| Git | Any recent | https://git-scm.com |
+| Snowflake Account | Free trial OK | https://snowflake.com/try-snowflake |
 
 ---
 
 ## Step 1 — Clone the Repository
 
 ```bash
-git clone https://github.com/shaileshchalke/snowflake-finops-toolkit.git
+git clone https://github.com/YOUR_USERNAME/snowflake-finops-toolkit.git
 cd snowflake-finops-toolkit
 ```
 
@@ -29,15 +21,25 @@ cd snowflake-finops-toolkit
 
 ## Step 2 — Create Virtual Environment
 
+**Windows (Command Prompt):**
+```cmd
+python -m venv venv
+venv\Scripts\activate.bat
+```
+
+**Windows (Git Bash / PowerShell):**
 ```bash
-# Windows (Git Bash)
 python -m venv venv
 source venv/Scripts/activate
+```
 
-# Mac / Linux
+**Mac / Linux:**
+```bash
 python3 -m venv venv
 source venv/bin/activate
 ```
+
+You should see `(venv)` in your terminal prompt.
 
 ---
 
@@ -47,68 +49,58 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Expected output: All packages installed with no errors.  
-Total install time: ~2-3 minutes.
-
 ---
 
-## Step 4 — Configure Environment Variables
+## Step 4 — Configure Snowflake Credentials
 
 ```bash
 # Copy the template
 cp .env.example .env
-
-# Edit with your credentials
-notepad .env          # Windows
-# OR
-nano .env             # Mac/Linux
 ```
 
-Fill in these required values in `.env`:
+Open `.env` in any text editor and fill in your values:
 
 ```
-SNOWFLAKE_ACCOUNT=your_account_identifier
-SNOWFLAKE_USER=your_username
-SNOWFLAKE_PASSWORD=your_password
+SNOWFLAKE_ACCOUNT=myorg-myaccount
+SNOWFLAKE_USER=myusername
+SNOWFLAKE_PASSWORD=mypassword
+SNOWFLAKE_WAREHOUSE=COMPUTE_WH
+SNOWFLAKE_DATABASE=FINOPS_DEMO
+SNOWFLAKE_SCHEMA=FINOPS_SAMPLE
 SNOWFLAKE_ROLE=SYSADMIN
 ```
 
-### How to find your Snowflake Account Identifier
-
-1. Log into Snowflake Web UI
-2. Click your username (bottom left)
-3. Click "Copy Account Identifier"
-4. Format: `orgname-accountname`
+**How to find your SNOWFLAKE_ACCOUNT:**
+- Log in to app.snowflake.com
+- Go to Admin > Accounts
+- Copy the value in format: `orgname-accountname`
 
 ---
 
 ## Step 5 — Generate Sample Data
 
-This script creates the `FINOPS_DEMO` database, `FINOPS_SAMPLE` schema,  
-and uploads 12 warehouses × 28 days of realistic demo data.
-
 ```bash
-make setup-sample-data
-# OR
 python src/generate_sample_data.py
 ```
 
 Expected output:
 ```
-✅ Connected to Snowflake.
-✅ Schema ready.
-✅ Metering data uploaded.
-✅ User attribution data uploaded.
-🎉 Sample data generation complete!
+INFO  Connected: account=myorg-myaccount, database=FINOPS_DEMO
+INFO  Creating FINOPS_DEMO database and FINOPS_SAMPLE schema...
+INFO  Creating tables...
+INFO  Uploading 336 metering rows...
+INFO  Uploading user attribution rows...
+INFO  WH_METERING_HISTORY rows: 336
+INFO  USER_ATTRIBUTION rows: 392
+INFO  Sample data generation complete!
+INFO  Run: streamlit run app/streamlit_app.py
 ```
 
 ---
 
-## Step 6 — Launch the Dashboard
+## Step 6 — Launch Dashboard
 
 ```bash
-make run
-# OR
 streamlit run app/streamlit_app.py
 ```
 
@@ -116,65 +108,20 @@ Open your browser at: **http://localhost:8501**
 
 ---
 
-## Step 7 — Run Tests
+## Step 7 — Run Tests (Optional)
 
 ```bash
-make test
+pytest tests/ -v
 ```
-
-All 35+ tests should pass. Tests use mock connectors — no live Snowflake needed.
-
----
-
-## Connecting to ACCOUNT_USAGE (Production Mode)
-
-If your Snowflake account has ACCOUNTADMIN or GOVERNANCE_VIEWER role,  
-the toolkit automatically detects and switches to ACCOUNT_USAGE mode.
-
-To enable:
-1. Set `SNOWFLAKE_ROLE=ACCOUNTADMIN` in `.env`
-2. Restart the dashboard
-
-No code changes needed — mode detection is automatic.
 
 ---
 
 ## Troubleshooting
 
-| Error                              | Solution                                              |
-|------------------------------------|-------------------------------------------------------|
-| `SNOWFLAKE_ACCOUNT not found`      | Check `.env` file exists and has correct account ID   |
-| `250001: Could not connect`        | Verify account identifier format: `orgname-accountname` |
-| `002043: SQL not found`            | Run `make setup-sample-data` first                    |
-| `ModuleNotFoundError`              | Run `pip install -r requirements.txt` again           |
-| Dashboard loads but shows no data  | Check Snowflake role has SELECT on FINOPS_DEMO schema |
-
----
-
-## Git Bash — Upload to GitHub
-
-```bash
-# Navigate to project folder
-cd snowflake-finops-toolkit
-
-# Initialize git (first time only)
-git init
-
-# Stage all files
-git add .
-
-# Commit
-git commit -m "Initial commit: Snowflake FinOps Toolkit v1.0"
-
-# Add GitHub remote (replace with your actual repo URL)
-git remote add origin https://github.com/shaileshchalke/snowflake-finops-toolkit.git
-
-# Push to GitHub
-git push -u origin main
-```
-
-If you get `rejected` error:
-```bash
-git pull origin main --allow-unrelated-histories
-git push origin main
-```
+| Error | Fix |
+|-------|-----|
+| `ModuleNotFoundError: snowflake` | Run `pip install -r requirements.txt` |
+| `250001: Could not connect` | Check SNOWFLAKE_ACCOUNT format: `orgname-accountname` |
+| `002003: Object does not exist` | Run `python src/generate_sample_data.py` first |
+| `Permission denied on ACCOUNT_USAGE` | Use SYSADMIN or ACCOUNTADMIN role |
+| Dashboard blank / no data | Refresh browser, check .env values |

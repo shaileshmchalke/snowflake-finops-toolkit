@@ -1,35 +1,30 @@
-# =============================================================================
-# Snowflake FinOps Toolkit — Python Dependencies
-# Author: Shailesh Chalke — Senior Snowflake Consultant
+# Snowflake FinOps Toolkit - Dependencies
+# Updated: 2026
 # Install: pip install -r requirements.txt
-# =============================================================================
 
-# ── Snowflake ─────────────────────────────────────────────────────────────
-snowflake-connector-python[pandas]==3.7.0
-snowflake-sqlalchemy==1.5.3
+# Snowflake connector with pandas support
+snowflake-connector-python[pandas]==3.12.0
 
-# ── Web Dashboard ─────────────────────────────────────────────────────────
-streamlit==1.32.0
-plotly==5.19.0
+# Streamlit dashboard
+streamlit==1.44.0
 
-# ── Data Processing ───────────────────────────────────────────────────────
-pandas==2.2.1
+# Data processing
+pandas==2.2.3
 numpy==1.26.4
-scipy==1.12.0
 
-# ── Configuration ─────────────────────────────────────────────────────────
+# Visualization
+plotly==5.24.1
+
+# Environment variables
 python-dotenv==1.0.1
-PyYAML==6.0.1
 
-# ── Cryptography (for key-pair auth) ─────────────────────────────────────
-cryptography==42.0.5
+# Key-pair authentication support
+cryptography==43.0.3
 
-# ── Testing ───────────────────────────────────────────────────────────────
-pytest==8.1.1
-pytest-cov==5.0.0
-pytest-mock==3.14.0
+# Testing
+pytest==8.3.3
+pytest-cov==6.0.0
 
-# ── Development / Code Quality ────────────────────────────────────────────
-black==24.3.0
-flake8==7.0.0
-isort==5.13.2
+# Code quality (optional but recommended)
+black==24.10.0
+flake8==7.1.1

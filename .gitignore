@@ -1,80 +1,46 @@
-# =============================================================================
-# Snowflake FinOps Toolkit — .gitignore
-# =============================================================================
-
-# ── Environment & Secrets ──────────────────────────────────────────────────
+# Credentials — NEVER commit these
 .env
-*.env
-.env.local
-.env.production
-secrets/
-*.pem
 *.p8
+*.pem
 *.key
+snowflake_config.yaml
 
-# ── Python ────────────────────────────────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
+*.pyo
+*.pyd
 .Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-pip-wheel-metadata/
+.eggs/
 
-# ── Virtual Environments ──────────────────────────────────────────────────
+# Virtual environments
 venv/
-.venv/
 env/
+.venv/
 ENV/
-.virtualenv/
 
-# ── Testing ───────────────────────────────────────────────────────────────
+# Testing & coverage
 .pytest_cache/
 .coverage
 htmlcov/
-.tox/
-*.coveragerc
 coverage.xml
-nosetests.xml
-test-results/
 
-# ── IDE / Editors ─────────────────────────────────────────────────────────
-.idea/
+# IDEs
 .vscode/
+.idea/
 *.swp
 *.swo
-*.DS_Store
-Thumbs.db
-.project
-.classpath
 
-# ── Streamlit ─────────────────────────────────────────────────────────────
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
 .streamlit/secrets.toml
 
-# ── Logs ──────────────────────────────────────────────────────────────────
+# Logs
 *.log
 logs/
-
-# ── Jupyter ───────────────────────────────────────────────────────────────
-.ipynb_checkpoints/
-*.ipynb
-
-# ── Local files NOT for GitHub ────────────────────────────────────────────
-marathi-setup-guide.md
-local-notes/
-scratch/

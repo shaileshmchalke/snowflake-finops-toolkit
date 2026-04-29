@@ -1,39 +1,32 @@
 """
-Anomaly Detector — Z-score based spike and slow-creep detection.
-Author: Shailesh Chalke — Senior Snowflake Consultant
-
-ALGORITHMS:
-1. Z-Score: (daily_credits - rolling_mean) / rolling_std
-2. Spike Detection: |z_score| > 3.0 on any single day
-3. Slow Creep: 7+ consecutive days with positive daily delta
+Anomaly Detector - Z-score spike detection and slow creep analysis.
+Author: Shailesh Chalke
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import List, Dict, Any
 
-import numpy as np
 import pandas as pd
+import numpy as np
 
 from snowflake_connector import SnowflakeConnector
 
 logger = logging.getLogger(__name__)
 
-SPIKE_Z_THRESHOLD   = 3.0    # z > 3.0 = statistically significant spike
-CREEP_WINDOW_DAYS   = 7      # consecutive positive days = slow creep
-ROLLING_WINDOW_7D   = 7      # 7-day rolling window for z-score
-ROLLING_WINDOW_30D  = 30     # 30-day rolling window for trend
+Z_SCORE_THRESHOLD    = 3.0
+CREEP_WINDOW_DAYS    = 7
+ROLLING_WINDOW_DAYS  = 7
 
 
 class AnomalyDetector:
     """
-    Detects two classes of cost anomalies:
-    1. Spikes: sudden single-day cost explosions (z > 3.0)
-    2. Slow Creep: gradual unnoticed increases (7+ consecutive positive days)
+    Detects cost anomalies using z-score analysis and slow-creep pattern detection.
     """
 
     def __init__(self, connector: SnowflakeConnector):
         self.conn  = connector
         self._mode = self._detect_mode()
+        logger.info(f"AnomalyDetector: running in {self._mode} mode")
 
     def _detect_mode(self) -> str:
         try:
@@ -44,326 +37,136 @@ class AnomalyDetector:
         except Exception:
             return "sample"
 
-    # ─────────────────────────────────────────
-    # TIMESERIES WITH Z-SCORE
-    # ─────────────────────────────────────────
-    def get_timeseries_with_zscore(self, days: int = 28) -> pd.DataFrame:
-        """
-        Return daily aggregated credit usage with 7-day rolling z-score.
-        Columns: usage_date, total_credits, rolling_mean_7d, rolling_std_7d,
-                 z_score, daily_delta
-        """
+    def _get_daily_credits(self, days: int = 28) -> pd.DataFrame:
+        """Fetch daily credit totals per warehouse."""
         if self._mode == "account_usage":
             sql = f"""
                 SELECT
                     DATE_TRUNC('DAY', start_time)::DATE AS usage_date,
-                    SUM(credits_used)                    AS total_credits
+                    warehouse_name,
+                    SUM(credits_used)                   AS total_credits
                 FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
-                WHERE start_time >= DATEADD('DAY', -{days + ROLLING_WINDOW_7D}, CURRENT_DATE())
-                  AND start_time <  CURRENT_TIMESTAMP()
-                GROUP BY 1
-                ORDER BY 1
+                WHERE start_time >= DATEADD('DAY', -{days}, CURRENT_DATE())
+                GROUP BY 1, 2
+                ORDER BY 2, 1
             """
         else:
             sql = f"""
                 SELECT
                     usage_date,
+                    warehouse_name,
                     SUM(total_credits) AS total_credits
                 FROM FINOPS_DEMO.FINOPS_SAMPLE.WH_METERING_HISTORY
-                WHERE usage_date >= DATEADD('DAY', -{days + ROLLING_WINDOW_7D}, CURRENT_DATE())
-                GROUP BY 1
-                ORDER BY 1
+                WHERE usage_date >= DATEADD('DAY', -{days}, CURRENT_DATE())
+                GROUP BY 1, 2
+                ORDER BY 2, 1
             """
+        try:
+            return self.conn.query_to_df(sql)
+        except Exception as e:
+            logger.error(f"_get_daily_credits failed: {e}")
+            return pd.DataFrame()
 
-        df = self.conn.query_to_df(sql)
+    def get_timeseries_with_zscore(self, days: int = 28) -> pd.DataFrame:
+        """
+        Return daily credits with z-score for each warehouse.
+        FIX: Division by zero prevented — std=0 case handled.
+        """
+        df = self._get_daily_credits(days)
         if df.empty:
             return pd.DataFrame()
 
-        df["usage_date"]    = pd.to_datetime(df["usage_date"])
-        df                  = df.sort_values("usage_date").reset_index(drop=True)
-        df["total_credits"] = pd.to_numeric(df["total_credits"], errors="coerce").fillna(0)
+        results = []
+        for wh_name, group in df.groupby("warehouse_name"):
+            wh_df = group.copy().sort_values("usage_date").reset_index(drop=True)
+            credits = wh_df["total_credits"].values
 
-        # 7-day rolling statistics
-        df["rolling_mean_7d"] = (
-            df["total_credits"].rolling(window=ROLLING_WINDOW_7D, min_periods=3).mean()
-        )
-        df["rolling_std_7d"]  = (
-            df["total_credits"].rolling(window=ROLLING_WINDOW_7D, min_periods=3).std()
-        )
+            mean_val = np.mean(credits)
+            std_val  = np.std(credits)
 
-        # Z-score: (value - mean) / std; avoid division by zero
-        df["z_score"] = np.where(
-            df["rolling_std_7d"] > 0,
-            (df["total_credits"] - df["rolling_mean_7d"]) / df["rolling_std_7d"],
-            0.0,
-        )
+            # FIX: std=0 হे divide by zero prevent — flat line warehouses साठी z_score=0
+            if std_val > 0:
+                z_scores = (credits - mean_val) / std_val
+            else:
+                z_scores = np.zeros(len(credits))
 
-        # Daily delta (day-over-day change)
-        df["daily_delta"] = df["total_credits"].diff()
+            wh_df["z_score"]         = z_scores
+            wh_df["rolling_mean"]    = pd.Series(credits).rolling(
+                window=ROLLING_WINDOW_DAYS, min_periods=1
+            ).mean().values
+            wh_df["warehouse_name"]  = wh_name
+            results.append(wh_df)
 
-        # 30-day rolling mean for trend context
-        df["rolling_mean_30d"] = (
-            df["total_credits"].rolling(window=ROLLING_WINDOW_30D, min_periods=7).mean()
-        )
+        if not results:
+            return pd.DataFrame()
 
-        # Return only the requested days (trim warm-up period)
-        cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
-        df     = df[df["usage_date"] >= cutoff].reset_index(drop=True)
+        return pd.concat(results, ignore_index=True)
 
-        return df
-
-    # ─────────────────────────────────────────
-    # SPIKE DETECTION
-    # ─────────────────────────────────────────
-    def detect_spikes(self) -> List[Dict[str, Any]]:
+    def detect_spikes(self, days: int = 28) -> List[Dict[str, Any]]:
         """
-        Return list of spike events where z-score > SPIKE_Z_THRESHOLD (3.0).
-        Each spike includes warehouse_name, date, credits, z_score.
+        Return list of days where z-score exceeds threshold.
+        Sorted by severity (highest z-score first).
         """
-        if self._mode == "account_usage":
-            sql = f"""
-                WITH daily_wh AS (
-                    SELECT
-                        DATE_TRUNC('DAY', start_time)::DATE AS usage_date,
-                        warehouse_name,
-                        SUM(credits_used)                    AS total_credits
-                    FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
-                    WHERE start_time >= DATEADD('DAY', -35, CURRENT_DATE())
-                    GROUP BY 1, 2
-                ),
-                stats AS (
-                    SELECT
-                        warehouse_name,
-                        usage_date,
-                        total_credits,
-                        AVG(total_credits) OVER (
-                            PARTITION BY warehouse_name
-                            ORDER BY usage_date
-                            ROWS BETWEEN 6 PRECEDING AND 1 PRECEDING
-                        ) AS rolling_mean,
-                        STDDEV(total_credits) OVER (
-                            PARTITION BY warehouse_name
-                            ORDER BY usage_date
-                            ROWS BETWEEN 6 PRECEDING AND 1 PRECEDING
-                        ) AS rolling_std
-                    FROM daily_wh
-                )
-                SELECT
-                    warehouse_name,
-                    usage_date,
-                    total_credits,
-                    rolling_mean,
-                    rolling_std,
-                    CASE
-                        WHEN rolling_std > 0
-                        THEN (total_credits - rolling_mean) / rolling_std
-                        ELSE 0
-                    END AS z_score
-                FROM stats
-                WHERE CASE
-                        WHEN rolling_std > 0
-                        THEN ABS((total_credits - rolling_mean) / rolling_std)
-                        ELSE 0
-                      END > {SPIKE_Z_THRESHOLD}
-                  AND usage_date >= DATEADD('DAY', -28, CURRENT_DATE())
-                ORDER BY z_score DESC
-            """
-        else:
-            sql = f"""
-                WITH daily_wh AS (
-                    SELECT
-                        usage_date,
-                        warehouse_name,
-                        SUM(total_credits) AS total_credits
-                    FROM FINOPS_DEMO.FINOPS_SAMPLE.WH_METERING_HISTORY
-                    WHERE usage_date >= DATEADD('DAY', -35, CURRENT_DATE())
-                    GROUP BY 1, 2
-                ),
-                stats AS (
-                    SELECT
-                        warehouse_name,
-                        usage_date,
-                        total_credits,
-                        AVG(total_credits) OVER (
-                            PARTITION BY warehouse_name
-                            ORDER BY usage_date
-                            ROWS BETWEEN 6 PRECEDING AND 1 PRECEDING
-                        ) AS rolling_mean,
-                        STDDEV(total_credits) OVER (
-                            PARTITION BY warehouse_name
-                            ORDER BY usage_date
-                            ROWS BETWEEN 6 PRECEDING AND 1 PRECEDING
-                        ) AS rolling_std
-                    FROM daily_wh
-                )
-                SELECT
-                    warehouse_name,
-                    usage_date,
-                    total_credits,
-                    rolling_mean,
-                    rolling_std,
-                    CASE
-                        WHEN rolling_std > 0
-                        THEN (total_credits - rolling_mean) / rolling_std
-                        ELSE 0
-                    END AS z_score
-                FROM stats
-                WHERE CASE
-                        WHEN rolling_std > 0
-                        THEN ABS((total_credits - rolling_mean) / rolling_std)
-                        ELSE 0
-                      END > {SPIKE_Z_THRESHOLD}
-                  AND usage_date >= DATEADD('DAY', -28, CURRENT_DATE())
-                ORDER BY z_score DESC
-            """
-
-        df = self.conn.query_to_df(sql)
-        if df.empty:
+        ts_df = self.get_timeseries_with_zscore(days)
+        if ts_df.empty:
             return []
 
-        df["usage_date"] = pd.to_datetime(df["usage_date"])
-        return df.to_dict("records")
+        spike_df = ts_df[ts_df["z_score"].abs() >= Z_SCORE_THRESHOLD].copy()
+        spike_df = spike_df.sort_values("z_score", ascending=False)
 
-    # ─────────────────────────────────────────
-    # SLOW CREEP DETECTION
-    # ─────────────────────────────────────────
-    def detect_slow_creep(self) -> List[Dict[str, Any]]:
-        """
-        Detect warehouses with 7+ consecutive days of increasing costs.
-        This catches gradual query regression invisible to single-day z-score.
-        """
-        if self._mode == "account_usage":
-            sql = """
-                WITH daily_wh AS (
-                    SELECT
-                        DATE_TRUNC('DAY', start_time)::DATE AS usage_date,
-                        warehouse_name,
-                        SUM(credits_used)                    AS total_credits
-                    FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
-                    WHERE start_time >= DATEADD('DAY', -35, CURRENT_DATE())
-                    GROUP BY 1, 2
-                ),
-                with_delta AS (
-                    SELECT
-                        warehouse_name,
-                        usage_date,
-                        total_credits,
-                        LAG(total_credits) OVER (
-                            PARTITION BY warehouse_name ORDER BY usage_date
-                        ) AS prev_credits,
-                        total_credits - LAG(total_credits) OVER (
-                            PARTITION BY warehouse_name ORDER BY usage_date
-                        ) AS daily_delta
-                    FROM daily_wh
-                ),
-                with_sign AS (
-                    SELECT
-                        warehouse_name,
-                        usage_date,
-                        total_credits,
-                        daily_delta,
-                        CASE WHEN daily_delta > 0 THEN 1 ELSE 0 END AS is_increasing
-                    FROM with_delta
-                    WHERE prev_credits IS NOT NULL
-                ),
-                with_streak AS (
-                    SELECT
-                        warehouse_name,
-                        usage_date,
-                        total_credits,
-                        daily_delta,
-                        is_increasing,
-                        SUM(CASE WHEN is_increasing = 0 THEN 1 ELSE 0 END) OVER (
-                            PARTITION BY warehouse_name ORDER BY usage_date
-                            ROWS UNBOUNDED PRECEDING
-                        ) AS streak_group
-                    FROM with_sign
-                ),
-                streak_lengths AS (
-                    SELECT
-                        warehouse_name,
-                        MAX(usage_date)       AS streak_end_date,
-                        MIN(usage_date)       AS streak_start_date,
-                        COUNT(*)              AS consecutive_days,
-                        SUM(daily_delta)      AS total_credit_increase
-                    FROM with_streak
-                    WHERE is_increasing = 1
-                    GROUP BY warehouse_name, streak_group
-                    HAVING COUNT(*) >= 7
-                )
-                SELECT
-                    warehouse_name,
-                    streak_start_date,
-                    streak_end_date,
-                    consecutive_days,
-                    ROUND(total_credit_increase, 2) AS total_credit_increase
-                FROM streak_lengths
-                ORDER BY consecutive_days DESC
-            """
-        else:
-            # Sample data version using Python-side streak detection
-            sql = """
-                SELECT
-                    usage_date,
-                    warehouse_name,
-                    SUM(total_credits) AS total_credits
-                FROM FINOPS_DEMO.FINOPS_SAMPLE.WH_METERING_HISTORY
-                WHERE usage_date >= DATEADD('DAY', -35, CURRENT_DATE())
-                GROUP BY 1, 2
-                ORDER BY warehouse_name, usage_date
-            """
-            df = self.conn.query_to_df(sql)
-            if df.empty:
-                return []
-            return self._detect_creep_python(df)
+        spikes = []
+        for _, row in spike_df.iterrows():
+            spikes.append({
+                "warehouse_name": row.get("warehouse_name", ""),
+                "usage_date":     str(row.get("usage_date", "")),
+                "total_credits":  float(row.get("total_credits", 0)),
+                "z_score":        round(float(row.get("z_score", 0)), 2),
+            })
+        return spikes
 
-        df = self.conn.query_to_df(sql)
-        if df.empty:
+    def detect_slow_creep(self, days: int = 28) -> List[Dict[str, Any]]:
+        """
+        Detect warehouses with N consecutive days of increasing credit usage.
+        Catches gradual regression invisible to single-day z-score.
+        """
+        ts_df = self.get_timeseries_with_zscore(days)
+        if ts_df.empty:
             return []
-        return df.to_dict("records")
-
-    def _detect_creep_python(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
-        """
-        Python-side slow creep detection for sample data mode.
-        Finds 7+ consecutive days of increasing credits per warehouse.
-        """
-        df["usage_date"] = pd.to_datetime(df["usage_date"])
-        df = df.sort_values(["warehouse_name", "usage_date"])
 
         results = []
-        for wh, group in df.groupby("warehouse_name"):
-            group    = group.reset_index(drop=True)
-            deltas   = group["total_credits"].diff()
-            streak   = 0
-            start_idx = 0
-            total_increase = 0.0
+        for wh_name, group in ts_df.groupby("warehouse_name"):
+            wh_df  = group.sort_values("usage_date").reset_index(drop=True)
+            credits = wh_df["total_credits"].values
 
-            for i in range(1, len(deltas)):
-                if deltas.iloc[i] > 0:
-                    if streak == 0:
-                        start_idx      = i - 1
-                        total_increase = 0.0
-                    streak         += 1
-                    total_increase += deltas.iloc[i]
+            max_streak   = 0
+            curr_streak  = 0
+            streak_start = None
+            best_start   = None
+
+            for i in range(1, len(credits)):
+                if credits[i] > credits[i - 1]:
+                    if curr_streak == 0:
+                        streak_start = i - 1
+                    curr_streak += 1
+                    if curr_streak > max_streak:
+                        max_streak = curr_streak
+                        best_start = streak_start
                 else:
-                    if streak >= CREEP_WINDOW_DAYS:
-                        results.append({
-                            "warehouse_name":      wh,
-                            "streak_start_date":   group["usage_date"].iloc[start_idx],
-                            "streak_end_date":     group["usage_date"].iloc[i - 1],
-                            "consecutive_days":    streak,
-                            "total_credit_increase": round(total_increase, 2),
-                        })
-                    streak = 0
+                    curr_streak = 0
 
-            # Check streak at end of series
-            if streak >= CREEP_WINDOW_DAYS:
+            if max_streak >= CREEP_WINDOW_DAYS:
+                start_val = credits[best_start] if best_start is not None else 0
+                end_val   = credits[best_start + max_streak] if best_start is not None else 0
+                increase  = end_val - start_val
+                pct       = (increase / max(start_val, 0.001)) * 100
+
                 results.append({
-                    "warehouse_name":      wh,
-                    "streak_start_date":   group["usage_date"].iloc[start_idx],
-                    "streak_end_date":     group["usage_date"].iloc[-1],
-                    "consecutive_days":    streak,
-                    "total_credit_increase": round(total_increase, 2),
+                    "warehouse_name":      wh_name,
+                    "consecutive_days":    max_streak,
+                    "total_increase_pct":  round(pct, 1),
+                    "start_credits":       round(float(start_val), 2),
+                    "end_credits":         round(float(end_val), 2),
                 })
 
-        return sorted(results, key=lambda x: x["consecutive_days"], reverse=True)
+        results.sort(key=lambda x: x["consecutive_days"], reverse=True)
+        return results
